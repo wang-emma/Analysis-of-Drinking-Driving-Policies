@@ -1,0 +1,1104 @@
+\documentclass[a4paper]{article}
+
+
+% Set page size and margins
+% Replace `letterpaper' with `a4paper' for UK/EU standard size
+\usepackage{color}
+% Useful packages
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+\usepackage{titlesec}
+\usepackage{caption}
+\usepackage{booktabs}
+
+\usepackage[a4paper,top=1cm,bottom=1.5cm,left=2.5cm,right=2.5cm,marginparwidth=1cm]{geometry}
+\usepackage{tocloft}
+\usepackage{natbib}
+
+\renewcommand{\bottomfraction}{0}
+\parindent = 0pt
+
+\titlespacing{\section}{0ex}{0.5pc}{0.5pc}
+
+
+\title{Milestone 3: Blood alcohol limit changes upon crashes}
+\author{Emma Wang}
+\date{} %No dates
+
+\begin{document}
+
+\maketitle
+
+\section{Goal}
+
+The goal of this project is to analyze if the two \href{https://www.transport.govt.nz/about-us/what-we-do/queries/regulation-of-drink-driving-limits/}{changes in drink-driving limits in 2011/2014} affected the crashing events across New Zealand; if so, the effects will be quantified by the model building process.
+\section{Data Source}
+The primary data sources \href{https://opendata-nzta.opendata.arcgis.com/search?tags=crashes}{Crashing Analysis System} are published and actively maintained by NZ Transport Agency. The data (\emph{lastly updated Apr 8, 2022}) recorded the crashing cases in New Zealand from 2000 to 2021 with 72 variables. From the \href{https://opendata-nzta.opendata.arcgis.com/pages/cas-data-field-descriptions}{field description}, many variables may correlate with one another, where variable selection would be necessary to avoid over-fitting.
+
+\section{Data Processing}
+The first step was to check the input of each variable based on common sense. The data were pre-cleaned before publication as no suspicious values were found. \\
+The main tasks before fitting the models were to remove irrelevant variables, and to create new variables that would assist with solving the question of interest.\\
+<<message = FALSE, including = FALSE, echo = FALSE>>=
+# Data Importation
+pacman::p_load(tidyverse, magrittr, data.table, conflicted, here, naniar, mice, 
+        ragg, ggcorrplot, dagitty, glmnet, parallel, doParallel, knitr, 
+        kableExtra, biglm, DBI)
+
+# Resolve conflicts of functions
+conflict_prefer("select", "dplyr") 
+conflict_prefer("filter", "dplyr")
+conflict_prefer("extract", "tidyr")
+@
+Referring to the \href{https://opendata-nzta.opendata.arcgis.com/pages/cas-data-field-descriptions}{field description}, the time when each crash took place was recorded in years. The lack of detailed information will cause uncertainty in the categorization of the cases. For example, for an incident observed in 2011, it was unclear whether it happened after the first change or not. \\
+For the two changes in alcohol limits, the cases were categorized into 3 phases. Because both changes took place near the end of the year, the crashes in 2011/2014 were classified to the previous period. Thus, the variable \texttt{Change} was derived from \texttt{crashYear} as shown in \hyperref[tbl:change]{Table 1.}. It would be the key variable for investigating the effects of the changed policies. \\
+\begin{table}[h]
+  \centering
+    \caption{The categorization of the variable \texttt{Change}.}
+    \begin{tabular}{llc} 
+      \toprule
+      \textbf{Period} & \textbf{Label} & \textbf{Change} \\
+      \midrule
+      2000-2011 & Baseline & 0 \\ 
+      2012-2014 & Post-First Change & 1 \\ 
+      2015-2021 & Post-Second Change & 2 \\ 
+      \bottomrule
+    \end{tabular}
+    \label{tbl:change}
+\end{table}
+
+<<eval=FALSE>>=
+pacman::p_load(tidyverse, data.table, here)
+data_raw <- fread(here("Crash_Analysis_System_(CAS)_data.csv"))
+# Create variable `Change`
+data <- data_raw %>% 
+  mutate(Change = as.factor(case_when(crashYear <= 2011 ~ 0,
+                                      crashYear %in% 2012:2014 ~ 1,
+                                      crashYear > 2014 ~ 2)))
+@
+
+The variable \texttt{caseSeverity} recorded the most severe injury in the crashes in four different levels:  non-injury, minor, serious and fatal. \\
+Other variables recorded the exact numbers of injuries with certain level of severity in an accident(\texttt{minorInjuryCount}, \texttt{seriousInjuryCount} and \texttt{fatalCount}). They are the potential candidates for the response variables. 
+
+<<importcode, echo=FALSE, eval=FALSE>>=
+data <- data_raw %>% 
+  transform(weatherA = as.factor(weatherA), 
+            weatherB = as.factor(weatherB),
+            urban = as.factor(urban), 
+            trafficControl = as.factor(trafficControl), 
+            streetLight = as.factor(streetLight),
+            roadSurface = as.factor(roadSurface),
+            roadLane = as.factor(roadLane),
+            roadCharacter = as.factor(roadCharacter),
+            light = as.factor(light),
+            holiday = as.factor(holiday),
+            flatHill = as.factor(flatHill),
+            crashSHDescription = as.factor(crashSHDescription),
+            crashDirectionDescription = as.factor(crashDirectionDescription),
+            crashSeverity = ordered(case_when(
+                                crashSeverity == 'Non-Injury Crash' ~ 'N',
+                                crashSeverity == 'Minor Crash' ~ 'M',
+                                crashSeverity == 'Serious Crash' ~ 'S',
+                                crashSeverity == 'Fatal Crash' ~ 'F'),
+                                    levels = c('N','M','S','F')),
+            crashLocation1 = as.factor(crashLocation1), 
+            crashLocation2 = as.factor(crashLocation2),
+            directionRoleDescription = as.factor(directionRoleDescription),
+            tlaName = as.factor(tlaName),
+            region = as.factor(region)) %>%
+  mutate(baseline = ifelse(crashYear <= 2011,1,0),
+         firstChange = ifelse(crashYear %in% 2012:2014,1,0),
+         secondChange = ifelse(crashYear > 2014,1,0),
+         Change = as.factor(case_when(crashYear <= 2011 ~ 0,
+                                      crashYear %in% 2012:2014 ~ 1,
+                                      crashYear > 2014 ~ 2)))
+# Deal with missing values in injury counts
+complete_data <- data %>% select(crashSeverity, seriousInjuryCount, fatalCount,
+                                 minorInjuryCount) %>% complete.cases()
+data[!complete_data,] <- data[!complete_data,] %>%
+  mutate(minorInjuryCount = if_else(crashSeverity == "N", 0, 
+                                    as.double(minorInjuryCount)), 
+         seriousInjuryCount = if_else(crashSeverity %in% c("N", "M"), 0, 
+                                      as.double(seriousInjuryCount)), 
+         fatalCount = if_else(crashSeverity %in% c("N", "M", "S"), 0, 
+                              as.double(fatalCount)))
+@
+
+<<import, include=FALSE, echo = FALSE>>=
+load("data.Rdata")
+@
+For the complete data processing, please see the \hyperref[Appendix]{Appendix}.  
+
+\section{Data Exploration}
+In this section, the two proposed directions of analysis will be explored. Based on the missingness of each variable, and correlation between variables, it would be possible to perform variable selection and identify the important covariates in this section. 
+\subsection{Most severe injury in the crashes and changes in alcohol limits}
+
+<<fig.width = 5.6, fig.height = 3.2, message = FALSE>>=
+# Visualization: average cases per year
+annual_case.df <- data %>% 
+  select(Change, crashSeverity) %>% 
+  group_by(Change, crashSeverity) %>%
+  summarise(total_count = n()) %>%
+  mutate(total_years = case_when(Change == 0 ~ 12,
+                                 Change == 1 ~ 3,
+                                 Change == 2 ~ 7),
+         average_annual_count = total_count/total_years)
+
+annual_case.df %>%
+  ggplot +
+  geom_bar(aes(x = crashSeverity, y = average_annual_count, fill = Change),
+           stat = "identity", pos = "dodge") +
+  scale_x_discrete(labels = c("Non-injury", "Mild Injury", 
+                              "Severe Injury", "Fatal")) +
+  scale_y_continuous(limits = c(0, 28000), expand = c(0, 0)) +
+  labs(x = "Severity", y = "Average Annual Count") +
+  scale_fill_discrete(labels = c("Baseline", "Post-First Change", "Post-Second Change")) +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+@
+\begin{center}
+\small Fig 1. Distribution of the average annual counts of the most severe cases in the crashes across 3 periods of alcohol-limit changes. The average counts during the Post-First-change period were lower than that in the other period. \label{Fig1}
+\end{center}
+
+The counts were adjusted by the number of years in each period, as specified by \texttt{total\_years}. After the first change in drinking driving policies, there were significant reduction in crashing numbers.  An interesting observation was that the average counts increased after the second reduction in alcohol.
+\subsection{Changes in jnjuries counts across the years}
+<<fig.width= 5.6, fig.height = 3.2, message = FALSE>>=
+
+
+data %>% select(crashYear, fatalCount, minorInjuryCount, 
+                seriousInjuryCount, Change) %>%
+  pivot_longer(cols = 2:4, names_to = "Severity", values_to = "Count") %>%
+  mutate(Severity = gsub("^([a-z]+)([I|C].+)", "\\1", Severity)) %>%
+  group_by(crashYear, Severity) %>%
+  summarise(annual_count = sum(Count, na.rm = T), 
+            num_cases = n()) %>%
+  ggplot(aes(x = crashYear, y = 10 * annual_count/num_cases, colour = Severity)) +
+  geom_point()+
+  geom_line() +
+  geom_vline(xintercept = 2011, linetype = "dashed", colour = "orange") + 
+  geom_vline(xintercept = 2014, linetype = "dashed") +
+  labs(x = "Year", y = "Count of Injuries per 10 Case", 
+       title ="Annual total injuries in the crashs") +
+  theme_bw() +
+  annotate("text", label = c("First Change", "Second Change"), 
+           x = c(2007, 2018.5), y = 2, family = "mono", size = 3.5, 
+          fontface = "bold", colour = c("orange", "black"))
+
+@
+\begin{center}
+  \small Fig 2. Changes in average injury counts per 10 cases of various severity from 2000 to 2021. The two changes in drinking-driving regulations (2011, 2014) were marked by the dashed vertical lines. Minor injury was the leading type across the time. \label{fig:injc}
+\end{center}
+In \hyperref[fig:injc]{Fig 2.}, the minor-injury counts of the injuries per 10 cases increased before 2012. The decremented pattern started from 2012 might result from the reducing alcohol limit in 2011. \\
+After second change in alcoholic limit (2014-2016), we saw a dramatically reduction in the minor injury counts. Unexpectedly, the minor injuries increased significantly after 2016. We would build a model to see whether the changing policies played a role in pattern decribed above. 
+
+
+\subsection{Variable Selection for the Models}
+\subsubsection{Missing values analysis}\label{miss_val}
+
+Here the variables with more than 50\% missingness were identified.  
+Variables with more than 90\% missingness will be discarded because they had no predictive ability.\\ 
+The variables included in the Multiple Imputation would be assessed based on\\
+\textbf{1.} correlation with the outcome variables AND;\\
+\textbf{2.} causal relationship with the response. 
+
+Please see the next 2 subsections for the selection of key predictors for the models.
+<<fig.width= 7, fig.height = 4, warning = FALSE>>=
+# Variables with more than 50% missing values
+var_50_miss <- miss_var_summary(data) %>%
+  filter(pct_miss > 50) %>% 
+  select(variable) %>%
+  unlist %>% unname
+gg_miss_var(data %>% select(all_of(var_50_miss)), show_pct = T)+
+  labs(title="Percentages of missing values") +
+  theme(axis.text.y = element_text(size = 7))
+@
+
+\begin{center}
+\small Fig 3. Variables with more than 50\% missing values. \label{fig:miss_val}
+\end{center}
+
+
+\subsubsection{Correlation Analysis}\label{Correlation}
+
+The code and plot of correlation analysis were shown \hyperref[cor_appen]{here} in the Appendix. According to \hyperref[fig:cor]{Fig 5.} There were no strong correlations between the outcome variables with the covariates from the plot. \texttt{crashSeverity} only showed a noticeable positive correlation with the outcome variables \texttt{minorInjuryCount} and \texttt{fatalCount}. And it had a moderate negative correlation with \texttt{urban}. 
+
+
+\subsection{Other variables to be included in models}
+Using common sense and field descriptions, there were a list of variables that may contribute to the severity of the car crashes.  
+<<>>=
+road_conditions <- c("roadSurface", "NumberOfLanes", "speedLimit", "light",
+                     "roadLane", "streetLight", "trafficControl", "flatHill",
+                     "roadworks")
+location <- c("urban", "region")
+
+other_vehicles <- c("bicycle", "train", "slipOrFlood", "vehicle", "schoolBus",
+                    "truck", "vanOrUtility", "bus")
+
+time <- c("Change", "crashYear")
+weather <- c("weatherA", "weatherB")
+other_objects <- c("strayAnimal","bridge", "waterRiver", "cliffBank")
+@
+
+Those variables would also be imputed, if they had missing values. 
+
+\subsection{Multiple Imputation}
+As shown in the \hyperref[miss_val]{Missing values analysis}, there was large amount of missing values in the original data, especially in the key predictors. 
+<<>>=
+miss_var_summary(data) %>% filter(pct_miss > 0) %>% select(variable) %>% 
+  unlist %>% length # 47 variables with missing values out of 75
+pct_complete_case(data) # There were no complete cases in the original data
+@
+It was insensible to remove all the 47 incomplete variables. Therefore, Multiple Imputation was needed to make the most use of the data. Firstly, the irrelevant, duplicated variables were removed.  
+
+<<>>=
+# Variables without predictive powers
+var_set_up <- c("X", "Y", "OBJECTID")
+# Duplicated variables that represent information already in the data
+var_dup <- c("crashFinancialYear", "tlaId")
+# Variables with more than 90% missingness
+var_high_miss <- miss_var_summary(data) %>%
+  filter(pct_miss > 90) %>% 
+  select(variable) %>%
+  unlist %>% unname
+var_relevant <- setdiff(names(data), c(var_dup, var_set_up, var_high_miss))
+data_clean <- data %>% select(all_of(var_relevant))
+@
+
+<<include=FALSE>>=
+# Outcomes
+var_outcome <- c("crashSeverity", "fatalCount", "seriousInjuryCount", "minorInjuryCount")
+@
+For further variable selection, please see \hyperref[var_imp]{Variables included in the Multiple Imputation}. The key criteria were listed here:\\
+\textbf{1.} Variables with at least 0.2 correlation with the outcome variables;\\ 
+\textbf{2.} Key variables affecting the seveity of crash crashes, using common sense;\\
+\textbf{3.} Variables that were complete in the original data.
+
+
+The \hyperref[mice_appen]{complete Multiple Imputation} was included in the Appendix. For simplicity, the results were directly attached here.  \\
+
+<<impdata>>=
+# Imputation mids object with 10 imputations
+load("imp_all.Rdata")
+# The long data set
+load("comp_long.Rdata")
+@
+
+\section{Analytical Plan}
+
+From the exploration, the counts and severity of crashes after the first change in policies (2011) were less than the in the other two periods. The underlying reasons might be the changed policies -- we need to construct models and adjust for other variables before concluding.\\
+The analysis would be a supervised learning problem aiming to analyze the relationship between the severity of cases and policy changes in drinking-driving regulations.\\
+
+
+\subsection{The relationship between \texttt{Change} and probability of fatal or serious crash \texttt{crashSeverity}}
+One option would be to analyze the relationship between the most severe injury in the crashes and changes in alcohol limits. Due to the small number of fatal cases in the data, we would analyze them with serious cases together. \\
+
+Based on the workflow of imputed data\cite{buu11b}, the general plan to obtain the final models are listed here: \\
+\textbf{1.} Fit the unadjusted model on each copy of 10 copies of the imputed data, which only included \texttt{Change} as the explanatory variable;\\
+\textbf{2.} Fit the full adjusted model on each copy of imputed data, which included all the key predictors in the data set;\\
+\textbf{3.} Do variable selection for the each of full adjusted models using model selection techniques(e.g. LASSO and Ridge);\\
+\textbf{4.} Select the key variables using the majority rule (mimic the stepwise model selection in chapter 5.4 of Stef's book\cite{buu11b});\\
+\textbf{5.} Fit the model with the selected key variables in the step 4, together with (\texttt{Change}. Pool the estimates together. \\
+
+
+The response \texttt{crashSeverity} fell into four categories. A binary variable would be created, which is 1 if the severity was fatal or serious, otherwise 0. A logistic regression would be fitted by \texttt{glm()} function. \\
+
+\subsection{The relationship between \texttt{crashYear} and minor injury counts per case \texttt{minorInjuryCount}}
+According to \hyperref[fig:injc]{Fig 2.}, the counts of minor causalities per case varied significantly across different periods on a linear scale. Instead of using \texttt{Change}, we would fit a piece-wise linear regression on \texttt{crashYear} to demonstrate the effects of time. It were assumed (and observed in the plot) that turning points occurred in year 2011, 2014 and 2016. Piece-wise linear changes were built accordingly: 
+
+\begin{table}[h]
+  \centering
+    \caption{The segments of \texttt{crashYear} in the piece-wise linear regression.}
+    \begin{tabular}{llc} 
+      \toprule
+      \textbf{Period} & \textbf{Note} & \textbf{Code in the Model} \\
+      \midrule
+      2011-2014 & Post-First Change & \texttt{pmin(pmax(crashYear - 2011, 0), 3)} \\ 
+      2014-2016 & Post-Second Change & \texttt{pmin(pmax(crashYear - 2014, 0), 2)} \\ 
+      2016-2021 & The period of incremental pattern since 2016 & \texttt{pmax(crashYear - 2016, 0)} \\ 
+      
+      \bottomrule
+    \end{tabular}
+    \label{tbl:piecelinear}
+\end{table}
+
+If, after adjustment, the coefficients for either Post-First or Post-Second piece-wise linear terms were significant, the reductions in alcoholic limit was effective in reducing the injury counts.  
+
+Theoretically, the efficiency of the linear regression can be improved by using \texttt{biglm()}\cite{tho2020} function, especially for large data sets. The computation of the least square line took less memory, thus fewer time to execute. \\
+During model fitting, the execution time of the following 3 methods would be carefully compared by \texttt{system.time()}:\label{met:lm} \\
+\textbf{1. }\texttt{lm()};\\ 
+\textbf{2. }\texttt{biglm()} that fits all data at once; \\
+\textbf{3. }\texttt{biglm()} with chunks of data to be updated by \texttt{update()}. 
+\smallskip
+The final method would be chosen according to efficiency and the amount of useful information that the method can deliver.  
+
+
+
+\section{Results}
+\subsection{The relationship between \texttt{Change} and probability of fatal or serious crashes \texttt{crashSeverity}}
+\subsubsection{Unadjusted model}
+The unadjusted model only included \texttt{Change} as the explanatory variable.
+<<>>=
+# Build the model
+expr1 <- expression(glm(I(crashSeverity %in% c("F", "S")) ~ Change, 
+                        family = "binomial"))
+# Apply the expression to each of the 10 copies of the imputed data
+## fit_unadj <- with(imp_all, expr1)
+## save(fit_unadj, file = "fit_unadj.Rdata")
+load("fit_unadj.Rdata")
+
+# Pool the estimates
+sum_unadj <- pool(fit_unadj) %>% summary(conf.int = TRUE)
+sum_unadj %>% mutate_if(is.numeric, function(x)(round(x,4))) %>%
+  kbl(align = c("l", rep("c",7)), booktabs=T)
+@
+
+<<>>=
+# Extract the confidence intervals
+confint_unadj <- sum_unadj %>% select(`2.5 %`, `97.5 %`)
+cbind(term = sum_unadj[,"term"], 100*(exp(confint_unadj)-1)) %>% kbl(booktabs=T)
+@
+
+As shown in the unadjusted model, the coefficients of \texttt{Change1} and \texttt{Change2} were both highly significant ($p$-value close to 0). \\
+The model equation was:
+$$
+\text{logit}(p_i)=\beta_0+\beta_1\times\text{Change1}_i+\beta_2\times\text{Change2}_i
+$$
+$$Y_i\sim\text{Binomial}(n_i,p_i)$$
+where for the $i^{\text{th}}$ crash in the data, $p_i$ denotes the probability of fatal or serious crash.  $\text{Change1}_i$ was a dummy variable that was 1 if the crash took place in the post-first change period (2012-2014), otherwise 0.  $\text{Change2}_i$ was a dummy variable that was 1 if the crash was in the post-second change period (2015-2021), otherwise 0.\\
+For the unadjusted model, the probabilities of serious or fatal cases increased after the 2 changes. Let's look at the adjusted model. 
+
+\subsubsection{Adjusted Model}
+The selection of variables included in the adjusted model involved parallel computation\cite{rco22} and LASSO with 1-SE rule(\texttt{glmnet} package\cite{fri10}). For more details, please see the section \hyperref[adj_mod]{Adjusted Model}. The final adjusted model was shown here: 
+<<>>=
+expr2 <- expression(glm(I(crashSeverity %in% c("F", "S")) ~ 
+                          Change + bicycle + cliffBank + motorcycle 
+                        + NumberOfLanes + roadLane + speedLimit 
+                        + streetLight + train + truck + waterRiver 
+                        + weatherA, family = "binomial"))
+## fit_adj <- with(imp_all, expr2)
+## save(fit_adj, file = "fit_adj.Rdata")
+load("fit_adj.Rdata")
+
+sum_adj <- pool(fit_adj) %>% summary(conf.int = TRUE)
+sum_adj %>% mutate_if(is.numeric, function(x)(round(x,4))) %>%
+  kbl(align = c("l", rep("c",7)), booktabs = T, digits = 3)
+@
+
+<<>>=
+# Extract the confidence intervals
+confint_adj <- sum_adj %>% 
+  filter(term %in% c("Change1", "Change2")) %>% select(`2.5 %`, `97.5 %`)
+cbind(term=c("Change1", "Change2"),100*(exp(confint_adj)-1)) %>% 
+  kbl(booktabs = T, digits = 3)
+@
+\bigskip
+
+After being adjusted by other variables, the coefficient of \texttt{Change2} was significant, but not for \texttt{Change1}.\\
+
+Comparing the the baseline period, there was 95\% confidence that the odds of fatal or serious cases after the first reduction of alcohol limit in 2014 increased by somewhere between 3.39\% to 7.81\%. \\
+No significant changes were seen after the first reduction in 2011, comparing to the baseline. \\
+
+
+In this case, only the first change has led to the reduction of the odds of fatal or serious crash. 
+
+
+\subsection{The relationship between \texttt{crashYear} and minor injury counts per case \texttt{minorInjuryCount}}
+
+For the \hyperref[met:lm]{methods for linear regression} proposed in last section, there were no significant differences in speed for direct \texttt{lm()} or \texttt{biglm()} functions.\\
+The method of updating \texttt{biglm()} by chunks of data was slower, due to the time and memory used to save the subsets of the data. \\
+Between \texttt{lm()} and \texttt{biglm()}, the former was more desirable because it conveyed relevant information for model fitness, such as \texttt{R-sqaured}.  
+
+\subsubsection{Unadjusted Piece-wise Linear Model}
+For the unadjusted model, only \texttt{crashYear} and the corresponding piece-wise linear terms were included. 
+
+<<eval=FALSE>>=
+p1 <- pmin(pmax(data$crashYear - 2011, 0), 3)
+p2 <- pmin(pmax(data$crashYear - 2014, 0), 2)
+p3 <- pmax(data$crashYear - 2016, 0)
+
+# Loop around all the 10 imputations
+fit_lm_unadj <- list(10)
+for(i in 1:10){
+  comp <- comp_long %>% filter(`.imp` == i)
+  fit_lm_unadj[[i]] <- lm(minorInjuryCount ~ crashYear 
+                          + p1 + p2 + p3, data = comp)
+}
+
+mira_lm_unadj <- fit_lm_unadj %>% as.mira
+@ 
+
+<<include=FALSE>>=
+load("mira_lm_unadj.Rdata")
+@
+
+<<>>=
+# Pool the estimates for confidence intervals
+pool(mira_lm_unadj) %>% 
+  summary(conf.int = TRUE) %>%
+  kbl(booktabs = T, digits = 3)
+@
+\bigskip
+
+All the piece-wise linear terms were highly significant. \\
+The model equation was:
+$$
+\mu_i=\beta_0+\beta_1\times\text{crashYear}_i+\beta_2\times\text{p1}_i + \beta_3\times\text{p2}_i+\beta_4\times\text{p3}_i
+$$
+$$Y_i\sim\text{Normal}(\mu_i,\sigma^2)$$
+where for the $i^{\text{th}}$ crash in the data, $\mu_i$ was the average number of minor injuries per crash.  $\text{p1}_i$ denoted the period between 2011--2014 where we assumed a gradient change since 2011. $\text{p2}_i$ and $\text{p3}_i$ were defined in similar ways that represented 2014--2016 and 2016--2021, respectively. \\
+The gradient changes at 2011 and 2014 were significant, which may or may not result from policy changes. In addition, the \hyperref[unadj_lm]{R\_squared} showed the model only explained around $0.1\%$ variability in the response. It would be necessary to adjust the model by other covariates, as shown in the next section. 
+
+\subsubsection{Adjusted Piece-wise Linear Model}
+
+The variables included in the adjusted model were selected using LASSO, and the detailed process was listed \hyperref[adj_lm]{here}. Besides the three piece-wise-linear terms, the variables \texttt{bicycle}, \texttt{cliffBank}, \texttt{motorcycle}, \texttt{roadLane}, \texttt{speedLimit}, \texttt{streetLight} and \texttt{weatherA} would be included in the final model.
+<<include=F>>=
+load("var_imp.Rdata")
+@
+The model was fitted to each copy of data, and the estimates were pooled together. 
+<<eval=FALSE>>=
+# Fit model for 10 copies of data
+fit_lm_adj <- list(10)
+for(i in 1:10){
+  comp <- comp_long %>% filter(`.imp` == i) %>%
+    select(all_of(var_pred_lm), minorInjuryCount)
+  fit_lm_adj[[i]] <- lm(minorInjuryCount ~ crashYear 
+                        + p1 + p2 + p3 
+                        + bicycle + cliffBank + motorcycle + roadLane 
+                        + speedLimit + streetLight + truck + weatherA, 
+                          data = comp)
+}
+mira_lm_adj <- fit_lm_adj %>% as.mira
+@ 
+<<include=FALSE>>=
+load("mira_lm_adj.Rdata")
+@
+<<>>=
+# Pool the estimates and show confidence intervals
+pool(mira_lm_adj) %>% summary(conf.int = TRUE) %>% kbl(booktabs = T, digits = 3)
+@
+\bigskip
+After adjustment, the three terms \texttt{p1}, \texttt{p2} and \texttt{p3} were still highly significant. The coefficients were slightly smaller than the unadjusted model. \\[5pt]
+Our goal was to find out the underlying linkage between alcoholic changes and car crashes. Thus, the key in this model was the interpretation of the piece-wise linear terms. We assumed, if the restricted drinking driving regulations were effective, the minor injuries should show significant negative trend from 2011 and 2014.\\[5pt] 
+The term \texttt{p1} showed that, on top of the general trend before 2011, there was a significant gradient change since then. With 95\% confidence, there was a further reduction of somewhere between 0.5 to 1 minor injuries per 100 cases. Similarly, the coefficient of \texttt{p2} showed that there was greater reduction in the gradient between 2014--2016, comparing the Post-first change period. Compared to the general trend before 2014, we have 95\% confidence that there was a further reduction of somewhere between 2.8 to 3.2 minor injuries per 100 cases. \\[5pt]
+The \texttt{R-squared} of this model was as low as 3\% (see \hyperref[final_lm]{Adjusted Model}). The covariates in the model were not sufficient to explain the fluctuations in the minor injury counts. The results, however, were as far as I could achieve using a combination of linear regression and LASSO. The further improvements would be proposed in the \hyperref[sec:dis]{Discussion} section. 
+
+\section{Discussion}\label{sec:dis}
+
+Drinking driving was a long-standing controversial topic. Followed by years of frequent drinking-related deaths on road, the government decided to reduce the legal alcohol limits. The first change in 2011 restricted zero alcohol intake for those under 20 years old, while the second change in 2014 further reduced the upper limits for those over 20. The goal of our project was to analyse the crash data and determine whether the changes in policies alleviated the accidents on road. 
+
+The data published by NZTA had an integrated structure, however, high degrees of missingness. This saved the efforts to tidy up the values present in the data. But dealing with the \texttt{NA}'s required much more efforts than I have expected. 
+\vspace{5pt}
+In the meantime, the data contained more than 700 thousands rows that covered the period 2000--2021. This was beneficial to analyse the effects of the two changes on a larger timescale. On the other hand, each modification or computation around the data set would take a lot of RAM, and special techniques were required to handle the large data. 
+\vspace{5pt}
+To make the most use of the variables, Multiple Imputations were implemented. To save computational powers, only certain variables were imputed: those significantly correlated or had significant contributions to the response variables. From the diagnostics, there were no significant issues with the imputation data (10 copies). 
+\vspace{5pt}
+To explain the relationships between the policy changes and crash data, supervised learning method was implemented. The \texttt{lm()} and \texttt{glm()} methods were chosen because it would be possible to obtain the coefficients and  interpret the effects. In contrast, other black-box methods (e.g. tree, random forest) focused more on the predictive accuracy of the model, which did not match our purpose. \\
+\vspace{5pt}
+For model selection, a combination of LASSO and parallel computation was used. For the probabilities of fatal cases, we concluded that the two reductions in drinking alcohol limits negatively affected the probabilities of fatal cases in New Zealand. Furthermore, the effect of the second reduction seemed to be less effective than the first one. \\
+In terms of minor injury counts per 100 accidents, we also saw significant reductions from 2011--2014 and 2014--2016. The second reduction would be A major drawback of the adjusted model, however, was the low \texttt{R-squared} around 3\%. For future improvements, LASSO with 1-SE rule might be too harsh on model selection and more variables would be needed to explain the variability in the response. 
+
+
+\vspace{5pt}
+There were, however, more limitations in the analysis: \\
+1. The categorization of the variable \texttt{Change} was inaccurate because the time of the case was only up to year level. This would cause bias in analysis;\\[5pt]
+2. The large number of missing values in the data would cause bias. The Multiple Imputation method was an approximation of the complete data;\\[5pt]
+3. For improvements, the models should be adjusted by other variables. For example, the number of cars on the road each year would contribute to the fluctuations in the number/severity of the car accidents. Also, on a larger time scale, the Financial Crisis started in 2008, and the global COVID pandemic might also affect vehicle usage and crash data.\\[5pt]
+4. There were no variables that directly link to alcoholic states of the drivers involving in the crash. Therefore, we had to analyse the effects of policy changes by gradients of changes of injuries on a longer time periods. Any conclusion drawn from there would not prove the direct contributions of the restricted alcohol limits. 
+
+\vspace{10pt}
+We may conclude that, on a larger timescale, there were reductions in minor injuries counts beyond 2011 and 2014, but not for the probabilities of serious or fatal cases.
+Restrictions on drinking driving policies may or may not directly played a role in the process (as discussed above). We hope they were effective, or at least, they had raised the awareness of the public on drinking driving.  
+
+
+\newpage
+
+\section{Appendix}\label{Appendix}
+
+\subsection{Data Importation and Transformation}
+<<message = FALSE, eval=FALSE>>=
+# Data Importation
+pacman::p_load(tidyverse, magrittr, data.table, conflicted, here, naniar, mice, 
+        ragg, ggcorrplot, dagitty, glmnet, parallel, doParallel, knitr, 
+        kableExtra, biglm, DBI)
+data_raw <- fread(here("Crash_Analysis_System_(CAS)_data.csv"))
+dim(data_raw)
+
+# Resolve conflicts of functions
+conflict_prefer("select", "dplyr") 
+conflict_prefer("filter", "dplyr")
+conflict_prefer("extract", "tidyr")
+
+# Transformation
+data <- data_raw %>% 
+  transform(weatherA = as.factor(weatherA), 
+            weatherB = as.factor(weatherB),
+            urban = as.factor(urban), 
+            trafficControl = as.factor(trafficControl), 
+            streetLight = as.factor(streetLight),
+            roadSurface = as.factor(roadSurface),
+            roadLane = as.factor(roadLane),
+            roadCharacter = as.factor(roadCharacter),
+            light = as.factor(light),
+            holiday = as.factor(holiday),
+            flatHill = as.factor(flatHill),
+            crashSHDescription = as.factor(crashSHDescription),
+            crashDirectionDescription = as.factor(crashDirectionDescription),
+            crashSeverity = ordered(levels = c('N','M','S','F'),
+              case_when(crashSeverity == 'Non-Injury Crash' ~ 'N',
+                        crashSeverity == 'Minor Crash' ~ 'M',
+                        crashSeverity == 'Serious Crash' ~ 'S',
+                        crashSeverity == 'Fatal Crash' ~ 'F')),
+            crashLocation1 = as.factor(crashLocation1), 
+            crashLocation2 = as.factor(crashLocation2),
+            directionRoleDescription = as.factor(directionRoleDescription),
+            tlaName = as.factor(tlaName),
+            region = as.factor(region)) %>%
+  mutate(baseline = ifelse(crashYear <= 2011,1,0),
+         firstChange = ifelse(crashYear %in% 2012:2014,1,0),
+         secondChange = ifelse(crashYear > 2014,1,0),
+         Change = as.factor(case_when(crashYear <= 2011 ~ 0,
+                                      crashYear %in% 2012:2014 ~ 1,
+                                      crashYear > 2014 ~ 2)))
+@
+
+
+To deal with the \texttt{NA}'s in the injury counts, I referred to the outcome variable \texttt{crashSeverity} that recorded the level of the most severe case in the crash. the main concept is: 
+\begin{itemize}
+  \item If \texttt{crashSeverity = "Non-Injury Crash"}, all the injury counts were 0.\\
+  That is, \texttt{minorInjuryCount = seriousInjuryCount = fatalInjuryCount = 0}.
+  \item If \texttt{crashSeverity = "Minor Crash"}, then all the other injury counts (\texttt{seriousInjuryCount = fatalInjuryCount = 0});
+  \item If \texttt{crashSeverity = "Serious Crash"}, the fatal counts was 0 ({\texttt{fatalInjuryCount = 0}}).
+\end{itemize}
+<<eval=FALSE>>=
+# Deal with missing values in injury counts
+complete_data <- data %>% select(crashSeverity, seriousInjuryCount, fatalCount,
+                                 minorInjuryCount) %>% complete.cases()
+# Replace NA's with 0
+data[!complete_data,] <- data[!complete_data,] %>%
+  mutate(minorInjuryCount = if_else(crashSeverity == "N", 0, 
+                                    as.double(minorInjuryCount)), 
+         seriousInjuryCount = if_else(crashSeverity %in% c("N", "M"), 0, 
+                                      as.double(seriousInjuryCount)), 
+         fatalCount = if_else(crashSeverity %in% c("N", "M", "S"), 0, 
+                              as.double(fatalCount)))
+
+data %>% select(crashSeverity, seriousInjuryCount, fatalCount,
+                                 minorInjuryCount) %>% miss_var_summary()
+@
+
+After the modification, nearly all the \texttt{NA}'s in the injury counts have been resolved. The single missing value in \texttt{minorInjuryCount} would be imputed in Multiple Imputation. 
+\subsection{Correltion Analysis}\label{cor_appen}
+<<fig.height = 6, warning = FALSE>>=
+# Create dataset to detect multicollinearity
+## collin <- data %>% lapply(as.numeric) %>% data.frame()
+
+# Correlations between variables in pairs, after removing missing values
+## cor_collin <- collin %>% cor(use='pairwise.complete.obs')
+## save(cor_collin, file= "cor_collin_all.Rdata")
+
+load("cor_collin_all.Rdata")
+# Inspect correlations for all
+ggcorrplot(cor_collin, title = "Correlation plot of the all relevant variables") + 
+  theme(axis.text.x = element_text(size = 5),
+        axis.text.y = element_text(size = 5))
+@
+\begin{center}
+  \small Fig 4. Correlation matrix of all variables in the data set.\label{fig:cor}
+\end{center}
+
+
+\subsection{Multiple Imputation with \texttt{\emph{mice}}\cite{buu11a} package}\label{mice_appen}
+\subsubsection{Variables included in the Multiple Imputation}\label{var_imp}
+<<message = FALSE>>=
+## 1. Variables that have at least 0.2 correlation with the key outcomes
+var_miss <- miss_var_summary(data_clean) %>%
+  filter(pct_miss > 0 & pct_miss < 70) %>%
+  select(variable) %>%
+  unlist %>% unname
+
+# Correlation
+collin_mid <- data_clean %>% 
+  select(all_of(var_miss), crashSeverity, minorInjuryCount, seriousInjuryCount, 
+         fatalCount) %>%
+  lapply(as.numeric) %>% 
+  data.frame()
+  
+# Correlations between variables in pairs, after removing missing values
+# cor_collin_mid <- collin_mid %>% cor(use='pairwise.complete.obs')
+# save(cor_collin_mid, file= "cor_collin_mid.Rdata")
+load("cor_collin_mid.Rdata")
+
+cor_outcome <- cor_collin_mid[c("crashSeverity","minorInjuryCount",
+                                "seriousInjuryCount", "fatalCount"),]
+ind <- apply(cor_outcome, 2, function(x) any(x > .2))
+var_high_cor <- colnames(cor_outcome)[ind]
+
+## 2. Key variables identified using common sense
+road_conditions <- c("roadSurface", "NumberOfLanes", "speedLimit", "light",
+                     "roadLane", "streetLight", "trafficControl", "flatHill",
+                     "roadworks")
+location <- c("urban", "region")
+
+other_vehicles <- c("bicycle", "train", "slipOrFlood", "vehicle", "schoolBus",
+                    "truck", "vanOrUtility", "bus")
+
+time <- c("Change", "crashYear")
+weather <- c("weatherA", "weatherB")
+other_objects <- c("strayAnimal","bridge", "waterRiver", "cliffBank")
+
+# Key predictors
+var_key_pred <- c(road_conditions, location, other_vehicles, time, weather,
+                  other_objects)
+
+
+## 3. Complete variables in the original data set
+var_complete <- miss_var_summary(data_clean) %>%
+  filter(pct_miss == 0) %>%
+  select(variable) %>%
+  unlist %>% unname
+
+## 4. Outcome variables
+var_outcome <- c("crashSeverity", "fatalCount", "seriousInjuryCount", "minorInjuryCount")
+
+# Variables to be included in the model
+var_model <- c(var_outcome, var_high_cor, var_key_pred, var_complete) %>% 
+  unique()
+# Irrelevant variables
+var_irrelevant <- setdiff(names(data_clean), var_model)
+@
+
+\subsubsection{Dry Run \& Modification of methods, prediction matrix and post-processing}
+A dry run was performed a dry run to check for the initial settings in the Multiple Imputation. From there, it was possible to modify and supply the methods, prediction matrix and post-processing in the real imputation.  \\
+
+<<>>=
+# Dry run
+## dry_run <- mice(data_clean, maxit = 0)
+## save(dry_run, file = "dry_run.Rdata")
+load("dry_run.Rdata")
+
+## pred_all <- quickpred(data_clean)
+## save(pred_all, file= "pred_all.Rdata")
+load("pred_all.Rdata")
+@
+
+\bigskip
+\textbf{Method}\\
+
+The default methods were used for the relevant variables, as selected by \texttt{mice()} function. \\
+In addition, \texttt{mice} could not handle variables with more than 50 unique values. Those variables would be be imputed, by setting \texttt{methods} to empty. 
+
+<<>>=
+# mice package cannot handle variables with more than 50 unique values
+var_name <- names(data_clean)
+## Do not impute variables with more than 50 unique values
+var_len_uniq <- data_clean %>% 
+  sapply(function(x) length(unique(x))) 
+
+# Method
+meth_all <- dry_run$method
+meth_all[all_of(var_irrelevant)] <- ""
+meth_all[var_name[var_len_uniq > 50]] <- ""
+@
+
+\bigskip
+\textbf{Prediction Matrix}\\
+
+A few modifications were made to the prediction matrix:
+\begin{enumerate}
+  \item Not predict irrelevant variables or use them to predict anything;
+  \item Not predict variables with more than 50 unique values, or use them to predict anything;
+  \item Do not impute variables derived from \texttt{Change} because of the high multi-collinearity with \texttt{Change}. Otherwise, this would cause errors in Multiple Imputation;
+  \item Set the diagonal to 0 such that the variables would not predict themselves. 
+  
+\end{enumerate}
+<<>>=
+## pred_all <- quickpred(data_clean)
+## save(pred_all, file= "pred_all.Rdata")
+load("pred_all.Rdata")
+
+# Not impute irrelevant variables or use them as predictors
+pred_all[all_of(var_irrelevant), ] <- 0
+pred_all[,all_of(var_irrelevant)] <- 0
+
+
+# Do not impute variables with more than 50 unique values or predict anything
+pred_all[var_name[var_len_uniq > 50],] <- 0
+pred_all[,var_name[var_len_uniq > 50]] <- 0
+
+# Not use variables derived from `Change` due to high collinearity with Change
+pred_all[,c("baseline", "firstChange", "secondChange")] <- 0
+
+# Not use crashYear to predict due to high collinearity with Change
+pred_all[,"crashYear"] <- 0
+pred_all["crashYear",] <- 0
+
+# Remove predictions that do not make sense
+pred_all[c("waterRiver", "cliffBank"), "bicycle"] <- 0
+# -------------------------------------------------------------------------------
+# Make the diagonal elements 0
+diag(pred_all) <- 0
+@
+\bigskip
+
+\textbf{Post-processing}\\
+
+The post-processing was done for the numeric variables, to ensure that the predicted values stayed in the realistic bound. 
+
+<<>>=
+# Variables to constrain the upper and lower limit
+numeric_vars <- data_clean %>% 
+  select(where(is.numeric)) %>% 
+  names()
+integer_vars <- data_clean %>% 
+  select(where(is.integer)) %>% 
+  names()
+num_int_vars <- c(numeric_vars, integer_vars)
+
+# Extract post
+post <- dry_run$post
+
+# Function takes variable name and creates a new squeezed variable, 
+# if it is already present in meth_all and is numeric
+
+squeeze_post <- function(var_name) {
+  if (meth_all[var_name] != '' & var_name %in% num_int_vars) {
+    post_value <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(", 
+                         min(data_clean[[var_name]], na.rm=TRUE), # Realistic lower bound
+                         ", ",
+                         2 * max(data_clean[[var_name]], na.rm=TRUE), # Realistic upper bound
+                         "))")
+    return(post_value)
+  } else {
+    return('')
+  }
+}
+
+# Add squeezes to post-processing variable, to pass to mice()
+for (i in 1:length(post)) {
+  post[names(post)[i]] <- squeeze_post(names(post)[i])
+}
+
+@
+
+
+\subsection{Run Multiple Imputation}
+
+There were 20 iterations in each of the 10 imputations. The imputed data were extracted and stored. 
+
+<<>>=
+# Parameters
+maxit_n <- 20 # maximal iterations
+seed <- 765
+m <- 10 # Number of imputation
+
+# Run the imputation
+## imp_all <- mice(data_clean, pred = pred_all, method = meth_all, 
+##                 post = post, m = m, maxit = maxit_n, seed = seed)
+## save(imp_all, file = "imp_all.Rdata")
+
+# Save data in long format
+## comp_long <- complete(imp_all, action = "long")
+## save(comp_long, file = "comp_long.Rdata")
+
+# Load the imputation data
+load("imp_all.Rdata")
+load("comp_long.Rdata")
+
+@
+
+
+\subsection{Diagnosis of Multiple Imputation}\label{imp_dis}
+\smallskip
+\textbf{Missing Values in the Imputed Variables}
+
+<<fig.width= 7, fig.height = 4, warning = FALSE>>=
+# Variables imputed in mice
+var_imp <- row.names(pred_all)[rowSums(pred_all) > 0]
+gg_miss_var(comp_long %>% select(all_of(var_imp)), show_pct = T)+
+  labs(title="Percentages of missing values") +
+  theme(axis.text.y = element_text(size = 7))
+@
+\begin{center}
+  \small Fig 5. The number of missing values in the imputed variables in the post-imputation data. \label{fig:imp_mis}
+\end{center}
+
+As shown in \hyperref[fig:imp_mis]{Fig 6.}, all the imputed variables were complete.  
+
+\bigskip
+\textbf{Convergence}\\
+
+The convergence of the imputation was analyzed by plotting the 10 streams in the plot. Each was independent without any trend. Therefore, there was no particular concern about the convergence. 
+
+Here was an example of the first four imputed variables:  
+
+\bigskip
+
+
+
+\subsection{Model for the Policy Change and Probability of Fatal or Serious Crash}
+\subsubsection{Unadjusted Model}
+<<eval=FALSE>>=
+# Build the model
+expr1 <- expression(glm(I(crashSeverity %in% c("F", "S")) ~ Change, family = "binomial"))
+# Apply the expression to each of the 10 copies of the imputed data
+## fit_unadj <- with(imp_all, expr1)
+## save(fit_unadj, file = "fit_unadj.Rdata")
+load("fit_unadj.Rdata")
+@
+
+<<>>=
+summary(pool(fit_unadj))
+
+# Confidence intervals
+confint_adj <- pool(fit_adj) %>% summary(conf.int = TRUE) %>% 
+  select(`2.5 %`, `97.5 %`)
+cbind(term = sum_unadj[,"term"], 100*(exp(confint_unadj)-1)) %>% 
+  kbl(booktabs = T))
+@
+
+\subsubsection{Adjusted Model}\label{adj_mod}
+Here we identified a list of key predictors to be included in the adjusted model.
+
+\bigskip
+\textbf{Model Selection}\\
+The long format of the imputed data included more than 7 million rows. For each copy of data, LASSO would be used to select the best set of predictors and Using 1-SE rule, \texttt{motorcycle} and \texttt{speedLimit} should be included in the model. The other key variables would also be included here.  
+
+<<>>=
+# Key predictors
+var_pred <- setdiff(c(var_imp, var_complete), 
+                    c(var_outcome, "baseline", "firstChange", "secondChange", 
+                      "crashYear"))
+
+# Function to be passed into parallel computation
+# Model selection using LASSO
+select_model <- function(...){
+  library(glmnet)
+  library(Matrix)
+  library(tidyverse)
+  i <- (...)
+  data_model <- comp_long %>% 
+    filter(`.imp` == i) %>%
+    select(all_of(var_pred), crashSeverity)
+  X <- data_model %>%
+    select(all_of(var_pred)) %>% 
+    sapply(as.numeric) %>%
+    Matrix()
+  y <- data_model %>%
+    mutate(Severity_FS = if_else(crashSeverity %in% c("F", "S"), 1, 0)) %>%
+    select(Severity_FS) %>% unlist %>% unname
+  fit <- glmnet(X, y, family = "binomial")
+  xval <- cv.glmnet(X, y)
+  return(coef(fit, s = xval$lambda.1se))}
+
+
+# Use Parallel Computation for model selection using LASSO
+
+# Make new cluster
+## cl <- makeCluster(5)
+
+# Export the objects to each cluster
+## clusterExport(cl, c('select_model', 'comp_long', "var_pred"))
+
+# Do the computation
+# par_output <- parLapply(cl, 1:m, fun = select_model)
+
+# Stop the cluster
+## stopCluster(cl)
+
+## save(par_output, file = "model_selection_fit.Rdata")
+
+
+# The outcome of LASSO was returned as a list
+load("model_selection_fit.Rdata")
+@
+
+  
+The occurrences of each variable in the 10 models were listed in the table. The majority method for pooling the variables was described in Section 5.4 of the \texttt{mice} book\cite{buu11b}. In another word, the more frequent a variable was present in the models, the more important it would be. 
+
+<<eval=FALSE>>=
+# Turn the list as a mira object
+fit_all <- par_output %>% as.mira
+
+# Find the names of variables where the coefficients were not 0 
+terms <- lapply(fit_all$analyses, function(x) row.names(x)[which(x != 0)])
+# Use majority rule
+votes <- unlist(terms)
+table(votes)
+@
+<<echo=FALSE>>=
+load("votes.Rdata")
+new
+@
+
+
+The variables \texttt{bicycle}, \texttt{cliffbank}, \texttt{motorcycle}, \texttt{NumberOfLanes}, \texttt{roadLane}, \texttt{speedLimit}, \texttt{streetLight}, \texttt{train}, \texttt{truck}, \texttt{waterRiver} and \texttt{weatherA} would be included in the final model, together with the key variable \texttt{Change}.\\
+
+\bigskip
+\textbf{Final Adjusted Model}\label{final_mod_adj}\\
+
+<<eval=FALSE>>=
+expr2 <- expression(glm(I(crashSeverity %in% c("F", "S")) ~ 
+                          Change + bicycle + cliffBank + motorcycle 
+                        + NumberOfLanes + roadLane + speedLimit 
+                        + streetLight + train + truck + waterRiver 
+                        + weatherA, family = "binomial"))
+## fit_adj <- with(imp_all, expr2)
+## save(fit_adj, file = "fit_adj.Rdata")
+load("fit_adj.Rdata")
+@ 
+<<>>=
+summary(pool(fit_adj))
+
+# Confidence intervals
+confint_adj <- pool(fit_adj) %>% summary(conf.int = TRUE) %>% 
+  filter(term %in% c("Change1", "Change2")) %>% 
+  select(`2.5 %`, `97.5 %`)
+cbind(term = c("Change1", "Change2"), 100*(exp(confint_adj)-1)) %>% 
+  kbl(booktabs = T)
+@
+
+
+\subsection{Model for the Policy Change and Counts of Minor Injuries per case , piece-wise linear model}
+\subsubsection{Unadjusted Model}\label{unadj_lm}
+
+<<eval=FALSE>>=
+# Loop around all the 10 imputations
+fit_lm_unadj <- list(10)
+for(i in 1:10){
+  comp <- comp_long %>% filter(`.imp` == i)
+  fit_lm_unadj[[i]] <- lm(minorInjuryCount ~ crashYear 
+                          + p1 + p2 + p3, data = comp)
+}
+
+mira_lm_unadj <- fit_lm_unadj %>% as.mira
+
+
+# Pool the estimates for confidence intervals
+pool(mira_lm_unadj) %>% 
+  summary(conf.int = TRUE) %>%
+  kbl(booktabs = T, digits = 3)
+@
+<<>>=
+r2_unadj <- sapply(mira_lm_unadj$analyses, function(mod) summary(mod)$r.squared)
+r2_unadj
+# Pool the estimates for confidence intervals
+pool(mira_lm_unadj) %>% summary(conf.int = TRUE)
+@
+
+\subsubsection{Adjusted Model}\label{adj_lm}
+Again, LASSO was used to identify the most important variables. 
+
+\bigskip
+\textbf{Model Selection}\\
+
+<<eval=FALSE>>=
+# Piecewise Linear Terms
+p1 <- pmin(pmax(data$crashYear - 2011, 0), 3)
+p2 <- pmin(pmax(data$crashYear - 2014, 0), 2)
+p3 <- pmax(data$crashYear - 2016, 0)
+
+# Key predictors
+var_pred_lm <- setdiff(c(var_imp, var_complete), 
+                    c(var_outcome, "baseline", "firstChange", "secondChange", 
+                      "Change"))
+
+comp_sub <- comp_long %>% select(`.imp`, all_of(var_pred_lm), minorInjuryCount)
+
+# Function to be passed into parallel computation
+# Model selection using LASSO
+select_model_lm <- function(...){
+  library(glmnet)
+  library(Matrix)
+  library(tidyverse)
+  i <- (...)
+  set.seed(i)
+  data_model <- comp_sub %>% 
+    filter(`.imp` == i)
+  
+  X <- data_model %>%
+    select(-minorInjuryCount, -`.imp`) %>% 
+    sapply(as.numeric) %>%
+    Matrix() %>% 
+  # Add the parallel terms
+    cbind(p1, p2, p3)
+  y <- data_model$minorInjuryCount
+  # Set penalty factors to 0 to keep the 3 piece-wise linear terms
+  fit <- glmnet(X, y, penalty.factor=c(rep(1, ncol(X)-3), 0, 0, 0))
+  xval <- cv.glmnet(X, y, 
+                    penalty.factor=c(rep(1, ncol(X)-3), 0, 0, 0))
+  return(coef(fit, s = xval$lambda.1se))
+}
+
+# Use Parallel Computation for model selection using LASSO
+
+# Make new cluster
+## cl <- makeCluster(5)
+
+# Export the objects to each cluster
+## clusterExport(cl, c('select_model_lm', 'comp_sub', "var_pred_lm", "p1", "p2", "p3"))
+
+# Do the computation
+# par_output_lm <- parLapply(cl, 1:m, fun = select_model_lm)
+
+# Stop the cluster
+## stopCluster(cl)
+
+## save(par_output_lm, file = "model_selection_lm_fit.Rdata")
+@
+<<>>=
+# The outcome of LASSO was returned as a list
+load("model_selection_lm_fit.Rdata")
+@
+
+  
+Similarly, the variables included in the adjusted model were the ones with major votes in the 10 models. 
+
+
+<<>>=
+# Mira object for pooling
+fit_lm_all <- par_output_lm %>% as.mira
+
+# Names of variables where the coefficients were not 0 
+terms_lm <- lapply(fit_lm_all$analyses, function(x) row.names(x)[which(x != 0)])
+# Use majority rule
+votes_lm <- unlist(terms_lm)
+table(votes_lm)
+@
+
+The variables \texttt{bicycle}, \texttt{cliffBank}, \texttt{motorcycle}, \texttt{roadLane}, \texttt{speedLimit}, \texttt{streetLight}, \texttt{truck} and \texttt{weatherA} would be included in the final model, together with the piecewise linear terms.\\
+
+\bigskip
+\textbf{Final Adjusted Simple Linear Regression Model}\label{final_lm}\\
+
+<<eval=FALSE>>=
+fit_lm_adj <- list(10)
+for(i in 1:10){
+  comp <- comp_long %>% 
+    filter(`.imp` == i) %>%
+    select(all_of(var_pred_lm), minorInjuryCount)
+  fit_lm_adj[[i]] <- lm(minorInjuryCount ~ crashYear 
+                        + p1 + p2 + p3
+                        + bicycle + cliffBank + motorcycle + roadLane 
+                        + speedLimit + streetLight + truck + weatherA,
+                          data = comp)
+}
+
+mira_lm_adj <- fit_lm_adj %>% as.mira
+@
+<<>>=
+# Compute r-square
+r2_adj <- sapply(mira_lm_adj$analyses, function(mod) summary(mod)$r.squared)
+r2_adj
+pool(mira_lm_adj) %>% summary(conf.int = TRUE)
+@
+
+\newpage 
+\nocite{buu11a}
+\nocite{buu11b}
+
+\bibliographystyle{plain}
+\bibliography{765Bib}
+
+
+\end{document}
