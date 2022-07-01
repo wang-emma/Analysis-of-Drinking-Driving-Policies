@@ -12,3 +12,8 @@ The goal of this project was to analyze whether the reductions in alcohol limits
 The crashing data(*lastly updated Apr 8, 2022*) were published and maintained by Ministry of Transport.  
 The size of data was too large to be uploaded. Please use the link below to naviagte to the original source:  
 https://opendata-nzta.opendata.arcgis.com/search?tags=crashes). 
+
+## Navigation of files
+* `M4Rsweave.Rnw` included the original code and write-ups;
+* `M4Report_Emma_Wang.pdf` was the knitted version of the report;
+* `M4Presentation_v2.pdf` included the slides for the presentation. 
