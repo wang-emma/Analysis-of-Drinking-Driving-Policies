@@ -1,4 +1,4 @@
-# Analysis-of-Drinking-Driving-Policies
+# Analysis of Drinking Driving Policies in New Zealand
 This is an R project of car crashes and drinking driving regulations in New Zealand. 
 
 ## Description
